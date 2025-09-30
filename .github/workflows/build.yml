@@ -58,6 +58,8 @@ jobs:
           body_path: commit.txt
           name: ${{ env.VERSION }}
           files: ${{ env.APP_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  
 
       - name: Delete Old Releases
         uses: sgpublic/delete-release-action@master
