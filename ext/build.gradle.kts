@@ -10,6 +10,8 @@ dependencies {
     compileOnly(libs.echo.common)
     compileOnly(libs.kotlin.stdlib)
 
+    implementation(libs.kotlinx.serialization.json)
+
     testImplementation(libs.junit)
     testImplementation(libs.coroutines.test)
     testImplementation(libs.echo.common)
@@ -84,7 +86,7 @@ tasks {
             )
         }
     }
-     // Disable test tasks for now
+     // Disabled test tasks for now
     test {
         enabled = false
     }

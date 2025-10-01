@@ -1,433 +1,382 @@
 package dev.brahmkshatriya.echo.extension
 
-import dev.brahmkshatriya.echo.common.clients.*
+import dev.brahmkshatriya.echo.common.clients.AlbumClient
+import dev.brahmkshatriya.echo.common.clients.ExtensionClient
+import dev.brahmkshatriya.echo.common.clients.HomeFeedClient
+import dev.brahmkshatriya.echo.common.clients.QuickSearchClient
+import dev.brahmkshatriya.echo.common.clients.SearchFeedClient
+import dev.brahmkshatriya.echo.common.clients.TrackClient
 import dev.brahmkshatriya.echo.common.helpers.Page
 import dev.brahmkshatriya.echo.common.helpers.PagedData
-import dev.brahmkshatriya.echo.common.models.*
+import dev.brahmkshatriya.echo.common.models.Album
+import dev.brahmkshatriya.echo.common.models.Feed
 import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
-import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeedData
-import dev.brahmkshatriya.echo.common.models.ImageHolder.Companion.toImageHolder
 import dev.brahmkshatriya.echo.common.models.NetworkRequest.Companion.toGetRequest
+import dev.brahmkshatriya.echo.common.models.QuickSearchItem
+import dev.brahmkshatriya.echo.common.models.Shelf
+import dev.brahmkshatriya.echo.common.models.Streamable
+import dev.brahmkshatriya.echo.common.models.Streamable.Source.Http
+import dev.brahmkshatriya.echo.common.models.Streamable.SourceType
+import dev.brahmkshatriya.echo.common.models.Track
 import dev.brahmkshatriya.echo.common.settings.Setting
-import dev.brahmkshatriya.echo.common.settings.SettingSwitch
 import dev.brahmkshatriya.echo.common.settings.Settings
 import dev.brahmkshatriya.echo.extension.groove.GrooveApi
+import dev.brahmkshatriya.echo.extension.groove.GrooveAlbumPageResult
 import dev.brahmkshatriya.echo.extension.groove.GrooveConverter
+import dev.brahmkshatriya.echo.extension.groove.GrooveSongDetailsResult
 import dev.brahmkshatriya.echo.extension.groove.GrooveQueries
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 
-class GrooveExtension : ExtensionClient, 
-    QuickSearchClient, HomeFeedClient, LibraryFeedClient, SearchFeedClient,
-    TrackClient, AlbumClient, PlaylistClient {
+class GrooveExtension : ExtensionClient, QuickSearchClient, SearchFeedClient, HomeFeedClient, AlbumClient, TrackClient {
 
-    override suspend fun getSettingItems(): List<Setting> {
-        return listOf(
-            SettingSwitch(
-                "show_cover_art_background",
-                "Show Cover Art Background",
-                "Enable cover art as background by default during playback",
-                true
-            )
-        )
-    }
+	private var settings: Settings? = null
+	private var converter: GrooveConverter = GrooveConverter(null)
+	private val api by lazy { GrooveApi() }
+	private val queries by lazy { GrooveQueries(api) }
+	private val songCache = mutableMapOf<String, GrooveSongDetailsResult>()
+	private val haryanviCategoryUrl = "https://pagalnew.com/category/haryanvi-mp3-tracks"
+	private val bollywoodCategoryUrl = "https://pagalnew.com/category/bollywood-tracks"
+	private val indipopCategoryUrl = "https://pagalnew.com/category/indipop-mp3-tracks"
+	private val punjabiCategoryUrl = "https://pagalnew.com/category/punjabi-mp3-tracks"
+	private val tamilCategoryUrl = "https://pagalnew.com/category/tamil-mp3-tracks"
+	private val englishCategoryUrl = "https://pagalnew.com/category/english-mp3-tracks"
+	private val djMixCategoryUrl = "https://pagalnew.com/category/dj-mix-mp3-songs"
+	private val categoryCache = mutableMapOf<String, CategoryCacheEntry>()
+	private val categoryConfigs = listOf(
+		CategoryConfig(haryanviCategoryUrl, "Haryanvi", "groove_haryanvi_albums"),
+		CategoryConfig(bollywoodCategoryUrl, "Bollywood", "groove_bollywood_albums"),
+		CategoryConfig(indipopCategoryUrl, "Indipop", "groove_indipop_albums"),
+		CategoryConfig(punjabiCategoryUrl, "Punjabi", "groove_punjabi_albums"),
+		CategoryConfig(tamilCategoryUrl, "Tamil", "groove_tamil_albums"),
+		CategoryConfig(englishCategoryUrl, "English", "groove_english_albums"),
+		CategoryConfig(djMixCategoryUrl, "DJ Mix", "groove_dj_mix_albums")
+	)
 
-    private lateinit var setting: Settings
-    override fun setSettings(settings: Settings) {
-        setting = settings
-    }
+	private data class CategoryConfig(
+		val url: String,
+		val fallbackName: String,
+		val albumShelfId: String
+	)
 
-    // API components - using lazy initialization to avoid creating instances until needed
-    private val api by lazy { GrooveApi() }
-    private val queries by lazy { GrooveQueries(api) }
-    private val converter by lazy { GrooveConverter(setting) }
+	private data class CategoryCacheEntry(
+		val timestamp: Long,
+		val categoryName: String,
+		val albums: List<Album>
+	)
 
-    // Helper function to ensure settings are initialized before accessing lazy properties
-    private fun ensureInitialized() {
-        if (!::setting.isInitialized) {
-            throw IllegalStateException("Settings not initialized. setSettings must be called before using the extension.")
-        }
-    }
+	override suspend fun getSettingItems(): List<Setting> = emptyList()
 
-    override suspend fun quickSearch(query: String): List<QuickSearchItem> {
-        if (query.isBlank()) return emptyList()
-        
-        return try {
-            ensureInitialized()
-            val response = queries.search(query)
-            if (!response.json.success) return emptyList()
-            
-            val items = mutableListOf<QuickSearchItem>()
-            
-            // Add songs to quick search
-            response.json.results.songs.take(5).forEach { song ->
-                items.add(QuickSearchItem.Media(converter.toTrack(song), false))
-            }
-            
-            // Add albums to quick search
-            response.json.results.albums.take(5).forEach { album ->
-                items.add(QuickSearchItem.Media(converter.toAlbum(album), false))
-            }
-            
-            items
-        } catch (e: Exception) {
-            println("DEBUG: Quick search failed: ${e.message}")
-            emptyList()
-        }
-    }
+	override fun setSettings(settings: Settings) {
+		this.settings = settings
+		converter = GrooveConverter(settings)
+	}
 
-    override suspend fun deleteQuickSearch(item: QuickSearchItem) {
-        // Not implemented for now
-    }
+	override suspend fun quickSearch(query: String): List<QuickSearchItem> {
+		if (query.isBlank()) return emptyList()
+		return try {
+			val result = queries.search(query)
+			val tracks = result.songs.map { QuickSearchItem.Media(converter.toTrack(it), false) }
+			val albums = result.albums.map { QuickSearchItem.Media(converter.toAlbum(it), false) }
+			(tracks + albums).take(10)
+		} catch (_: Exception) {
+			emptyList()
+		}
+	}
 
-    override suspend fun loadSearchFeed(query: String): Feed<Shelf> {
-        if (query.isBlank()) {
-            return emptyList<Shelf>().toFeed()
-        }
-        
-        return try {
-            ensureInitialized()
-            val response = queries.search(query)
-            if (!response.json.success) return emptyList<Shelf>().toFeed()
-            
-            val shelves = mutableListOf<Shelf>()
-            
-            // Process songs
-            if (response.json.results.songs.isNotEmpty()) {
-                val trackList = response.json.results.songs.map { converter.toTrack(it) }
-                shelves.add(Shelf.Lists.Tracks(
-                    id = "search_songs",
-                    title = "Songs",
-                    list = trackList
-                ))
-            }
-            
-            // Process albums
-            if (response.json.results.albums.isNotEmpty()) {
-                val albumList = response.json.results.albums.map { converter.toAlbum(it) }
-                shelves.add(Shelf.Lists.Items(
-                    id = "search_albums",
-                    title = "Albums",
-                    list = albumList
-                ))
-            }
-            
-            // Add tabs for better navigation
-            val tabs = listOf(
-                Tab("all", "All"),
-                Tab("songs", "Songs"),
-                Tab("albums", "Albums")
-            )
-            
-            Feed(tabs) { tab ->
-                when (tab?.id) {
-                    "songs" -> PagedData.Continuous { continuation ->
-                        val page = (continuation as? String)?.toIntOrNull() ?: 0
-                        try {
-                            // For now, we're just returning the same data since we don't have pagination
-                            Page(
-                                listOf(Shelf.Lists.Tracks(
-                                    id = "search_songs_tab",
-                                    title = "Songs",
-                                    list = response.json.results.songs.map { converter.toTrack(it) }
-                                )),
-                                null // No more pages for now
-                            )
-                        } catch (e: Exception) {
-                            println("DEBUG: Songs tab pagination failed: ${e.message}")
-                            Page(emptyList<Shelf>(), null)
-                        }
-                    }.toFeedData()
-                    "albums" -> PagedData.Continuous { continuation ->
-                        val page = (continuation as? String)?.toIntOrNull() ?: 0
-                        try {
-                            // For now, we're just returning the same data since we don't have pagination
-                            Page(
-                                listOf(Shelf.Lists.Items(
-                                    id = "search_albums_tab",
-                                    title = "Albums",
-                                    list = response.json.results.albums.map { converter.toAlbum(it) }
-                                )),
-                                null // No more pages for now
-                            )
-                        } catch (e: Exception) {
-                            println("DEBUG: Albums tab pagination failed: ${e.message}")
-                            Page(emptyList<Shelf>(), null)
-                        }
-                    }.toFeedData()
-                    else -> PagedData.Single { shelves }.toFeedData()
-                }
-            }
-        } catch (e: Exception) {
-            println("DEBUG: Search feed failed: ${e.message}")
-            emptyList<Shelf>().toFeed()
-        }
-    }
+	override suspend fun deleteQuickSearch(item: QuickSearchItem) {
+		// Nothing to delete for remote search suggestions.
+	}
 
-    override suspend fun loadHomeFeed(): Feed<Shelf> {
-        println("DEBUG: loadHomeFeed() called")
-        
-        return try {
-            ensureInitialized()
-            
-            val shelves = mutableListOf<Shelf>()
-            
-            // Try to get some featured content
-            try {
-                val response = queries.search("featured")
-                if (response.json.success) {
-                    // Add featured songs
-                    if (response.json.results.songs.isNotEmpty()) {
-                        val trackList = response.json.results.songs.take(10).map { converter.toTrack(it) }
-                        shelves.add(Shelf.Lists.Tracks(
-                            id = "featured_songs",
-                            title = "Featured Songs",
-                            list = trackList
-                        ))
-                    }
-                    
-                    // Add featured albums
-                    if (response.json.results.albums.isNotEmpty()) {
-                        val albumList = response.json.results.albums.take(10).map { converter.toAlbum(it) }
-                        shelves.add(Shelf.Lists.Items(
-                            id = "featured_albums",
-                            title = "Featured Albums",
-                            list = albumList
-                        ))
-                    }
-                }
-            } catch (e: Exception) {
-                println("DEBUG: Error loading featured content: ${e.message}")
-            }
-            
-            // Try to get trending content
-            try {
-                val response = queries.search("trending")
-                if (response.json.success) {
-                    // Add trending songs
-                    if (response.json.results.songs.isNotEmpty()) {
-                        val trackList = response.json.results.songs.take(10).map { converter.toTrack(it) }
-                        shelves.add(Shelf.Lists.Tracks(
-                            id = "trending_songs",
-                            title = "Trending Songs",
-                            list = trackList
-                        ))
-                    }
-                }
-            } catch (e: Exception) {
-                println("DEBUG: Error loading trending content: ${e.message}")
-            }
-            
-            println("DEBUG: Created home feed with ${shelves.size} shelves")
-            
-            if (shelves.isNotEmpty()) {
-                shelves.toFeed()
-            } else {
-                // Fallback to empty shelf
-                val emptyShelf = Shelf.Lists.Items(
-                    id = "no_content",
-                    title = "No Content Available",
-                    list = emptyList<EchoMediaItem>()
-                )
-                listOf(emptyShelf).toFeed()
-            }
-        } catch (e: Exception) {
-            println("DEBUG: Unexpected error in loadHomeFeed: ${e.message}")
-            e.printStackTrace()
-            
-            // Return error shelf for debugging
-            val errorShelf = Shelf.Lists.Items(
-                id = "home_error",
-                title = "Error: ${e.javaClass.simpleName}",
-                list = emptyList<EchoMediaItem>()
-            )
-            listOf(errorShelf).toFeed()
-        }
-    }
+	override suspend fun loadSearchFeed(query: String): Feed<Shelf> {
+		if (query.isBlank()) return emptyList<Shelf>().toFeed()
+		return try {
+			val result = queries.search(query)
+			val shelves = mutableListOf<Shelf>()
 
-    override suspend fun loadLibraryFeed(): Feed<Shelf> {
-        println("DEBUG: loadLibraryFeed() called")
-        
-        return try {
-            ensureInitialized()
-            
-            val shelves = mutableListOf<Shelf>()
-            
-            // Add library categories
-            val favoritesCategory = Shelf.Category(
-                id = "favorites",
-                title = "Favorites",
-                subtitle = "Your favorite music",
-                feed = null,
-                extras = mapOf("type" to "favorites")
-            )
-            shelves.add(favoritesCategory)
-            
-            val recentlyPlayedCategory = Shelf.Category(
-                id = "recently_played",
-                title = "Recently Played",
-                subtitle = "Your recently played tracks",
-                feed = null,
-                extras = mapOf("type" to "recently_played")
-            )
-            shelves.add(recentlyPlayedCategory)
-            
-            val playlistsCategory = Shelf.Category(
-                id = "playlists",
-                title = "My Playlists",
-                subtitle = "Your created playlists",
-                feed = null,
-                extras = mapOf("type" to "playlists")
-            )
-            shelves.add(playlistsCategory)
-            
-            println("DEBUG: Created library feed with ${shelves.size} shelves")
-            shelves.toFeed()
-        } catch (e: Exception) {
-            println("DEBUG: Error in loadLibraryFeed: ${e.message}")
-            e.printStackTrace()
-            
-            val errorShelf = Shelf.Category(
-                id = "library_error",
-                title = "Library",
-                subtitle = "Unable to load library content",
-                feed = null
-            )
-            listOf(errorShelf).toFeed()
-        }
-    }
+			if (result.songs.isNotEmpty()) {
+				shelves.add(
+					Shelf.Lists.Tracks(
+						id = "groove_search_songs",
+						title = "Songs",
+						list = result.songs.map { converter.toTrack(it) }
+					)
+				)
+			}
 
-    override suspend fun loadTrack(track: Track, isDownload: Boolean): Track {
-        return try {
-            ensureInitialized()
-            println("DEBUG: Loading track with ID: ${track.id}")
-            
-            // Use the slug from track extras to fetch full song details
-            // This ensures we're using the correct identifier for the API call
-            val slug = track.extras["slug"] ?: throw Exception("Track slug not found")
-            val response = queries.getSong(slug)
-            if (!response.json.success) throw Exception("Failed to fetch song details")
-            
-            converter.toTrack(response.json.song)
-        } catch (e: Exception) {
-            println("DEBUG: Failed to load track ${track.id}: ${e.message}")
-            throw Exception("Failed to load track: ${e.message}")
-        }
-    }
+			if (result.albums.isNotEmpty()) {
+				shelves.add(
+					Shelf.Lists.Items(
+						id = "groove_search_albums",
+						title = "Albums",
+						list = result.albums.map { converter.toAlbum(it) }
+					)
+				)
+			}
 
-    override suspend fun loadStreamableMedia(
-        streamable: Streamable, 
-        isDownload: Boolean
-    ): Streamable.Media {
-        return when (streamable.type) {
-            Streamable.MediaType.Server -> {
-                println("DEBUG: Loading streamable media")
-                
-                // Extract stream URL from extras
-                val streamUrl = streamable.extras["streamUrl"] 
-                    ?: throw Exception("No stream URL found")
-                
-                val quality = streamable.extras["quality"]?.toIntOrNull() ?: 128
-                
-                val httpSource = Streamable.Source.Http(
-                    request = streamUrl.toGetRequest(),
-                    type = Streamable.SourceType.Progressive,
-                    quality = quality,
-                    title = "${quality}kbps"
-                )
-                
-                Streamable.Media.Server(listOf(httpSource), false)
-            }
-            Streamable.MediaType.Background -> {
-                throw Exception("Background streamables not supported for audio content")
-            }
-            Streamable.MediaType.Subtitle -> {
-                throw Exception("Subtitles not supported")
-            }
-        }
-    }
+			if (shelves.isEmpty()) {
+				emptyList<Shelf>().toFeed()
+			} else {
+				shelves.toFeed()
+			}
+		} catch (_: Exception) {
+			emptyList<Shelf>().toFeed()
+		}
+	}
 
-    override suspend fun loadAlbum(album: Album): Album {
-        return try {
-            ensureInitialized()
-            println("DEBUG: Loading album with ID: ${album.id}")
-            
-            val slug = album.extras["slug"] ?: throw Exception("Album slug not found")
-            val response = queries.getAlbum(slug)
-            if (!response.json.success) throw Exception("Failed to fetch album details")
-            
-            converter.toAlbum(response.json.album)
-        } catch (e: Exception) {
-            println("DEBUG: Failed to load album ${album.id}: ${e.message}")
-            throw Exception("Failed to load album: ${e.message}")
-        }
-    }
+	override suspend fun loadHomeFeed(): Feed<Shelf> {
+		return try {
+			val shelves = mutableListOf<Shelf>()
+			try {
+				val response = queries.latestReleases()
+				val latestSongs = response.latestReleaseSongs.mapNotNull {
+					converter.toLatestReleaseTrack(it, response.timestamp)
+				}
+				if (latestSongs.isNotEmpty()) {
+					shelves.add(
+						Shelf.Lists.Tracks(
+							id = "groove_latest_release_songs",
+							title = "Latest Release Songs",
+							list = latestSongs
+						)
+					)
+				}
 
-    override suspend fun loadTracks(album: Album): Feed<Track>? {
-        return try {
-            ensureInitialized()
-            println("DEBUG: Loading tracks for album: ${album.id}")
-            
-            val slug = album.extras["slug"] ?: throw Exception("Album slug not found")
-            val response = queries.getAlbum(slug)
-            if (!response.json.success) throw Exception("Failed to fetch album details")
-            
-            // For album tracks, we don't have stream URLs in the album response
-            // When a user clicks on a track, it will call loadTrack which gets the full details
-            val tracks = converter.toTracks(response.json.album)
-            tracks.toFeed() as Feed<Track>
-        } catch (e: Exception) {
-            println("DEBUG: Failed to load tracks for album ${album.id}: ${e.message}")
-            null
-        }
-    }
+				val latestAlbums = response.recentBollywoodAlbums.mapNotNull {
+					converter.toLatestReleaseAlbum(it, response.timestamp)
+				}
+				if (latestAlbums.isNotEmpty()) {
+					shelves.add(
+						Shelf.Lists.Items(
+							id = "groove_recent_bollywood_albums",
+							title = "Recent Bollywood Albums",
+							list = latestAlbums
+						)
+					)
+				}
+			} catch (e: Exception) {
+				println("DEBUG: Failed to load latest releases: ${e.message}")
+			}
 
-    override suspend fun loadFeed(album: Album): Feed<Shelf>? {
-        return null
-    }
+			categoryConfigs.forEachIndexed { index, config ->
+				loadCategorySection(config, shelves)
+				if (index < categoryConfigs.lastIndex) {
+					delay(CATEGORY_LOAD_DELAY_MS)
+				}
+			}
 
-    override suspend fun loadFeed(track: Track): Feed<Shelf> {
-        return emptyList<Shelf>().toFeed()
-    }
+			if (shelves.isNotEmpty()) {
+				shelves.toFeed()
+			} else {
+				emptyList<Shelf>().toFeed()
+			}
+		} catch (_: Exception) {
+			emptyList<Shelf>().toFeed()
+		}
+	}
 
-    // PlaylistClient implementation
-    override suspend fun loadPlaylist(playlist: Playlist): Playlist {
-        return try {
-            ensureInitialized()
-            println("DEBUG: Loading playlist with ID: ${playlist.id}")
-            
-            // For now, we'll just return the playlist as-is since we don't have playlist support yet
-            playlist
-        } catch (e: Exception) {
-            println("DEBUG: Failed to load playlist ${playlist.id}: ${e.message}")
-            throw Exception("Failed to load playlist: ${e.message}")
-        }
-    }
+	override suspend fun loadAlbum(album: Album): Album {
+		val albumUrl = album.extras["url"] ?: return album
+		return try {
+			val response = queries.albumPage(albumUrl)
+			val result = converter.toAlbumPage(response)
+			val mergedExtras = album.extras + result.album.extras
+			result.album.copy(extras = mergedExtras)
+		} catch (_: Exception) {
+			album
+		}
+	}
 
-    override suspend fun loadTracks(playlist: Playlist): Feed<Track> {
-        return try {
-            ensureInitialized()
-            println("DEBUG: Loading tracks for playlist: ${playlist.id}")
-            
-            // For now, we'll return an empty feed since we don't have playlist support yet
-            emptyList<Track>().toFeed() as Feed<Track>
-        } catch (e: Exception) {
-            println("DEBUG: Failed to load tracks for playlist ${playlist.id}: ${e.message}")
-            emptyList<Track>().toFeed() as Feed<Track>
-        }
-    }
+	override suspend fun loadTracks(album: Album): Feed<Track>? {
+		val albumUrl = album.extras["url"] ?: return null
+		return PagedData.Continuous { continuation ->
+			val targetUrl = (continuation as? String)?.takeIf { it.isNotBlank() } ?: albumUrl
+			val page = fetchAlbumTracksPage(targetUrl)
+			if (page != null) {
+				Page(page.tracks, page.nextPageUrl)
+			} else {
+				Page(emptyList<Track>(), null)
+			}
+		}.toFeed()
+	}
 
-    override suspend fun loadFeed(playlist: Playlist): Feed<Shelf>? {
-        return try {
-            ensureInitialized()
-            println("DEBUG: Loading feed for playlist: ${playlist.id}")
-            
-            // For now, we'll return null since we don't have playlist feed support yet
-            null
-        } catch (e: Exception) {
-            println("DEBUG: Failed to load feed for playlist ${playlist.id}: ${e.message}")
-            null
-        }
-    }
+	override suspend fun loadTrack(track: Track, isDownload: Boolean): Track {
+		val sourceUrl = track.extras["url"] ?: return track
+		return try {
+			val details = fetchSongDetails(sourceUrl)
+			val detailedTrack = details.track
+			val mergedExtras = track.extras + detailedTrack.extras
+			val mergedArtists = if (track.artists.isNotEmpty()) track.artists else detailedTrack.artists
+			val mergedAlbum = track.album ?: detailedTrack.album
+
+			detailedTrack.copy(
+				id = track.id.ifEmpty { detailedTrack.id },
+				title = track.title.ifBlank { detailedTrack.title },
+				cover = detailedTrack.cover ?: track.cover,
+				background = detailedTrack.background ?: track.background,
+				artists = mergedArtists,
+				album = mergedAlbum,
+				subtitle = track.subtitle ?: detailedTrack.subtitle,
+				extras = mergedExtras,
+				streamables = detailedTrack.streamables,
+				isPlayable = detailedTrack.isPlayable
+			)
+		} catch (_: Exception) {
+			track
+		}
+	}
+
+	override suspend fun loadStreamableMedia(streamable: Streamable, isDownload: Boolean): Streamable.Media {
+		if (streamable.type != Streamable.MediaType.Server) {
+			throw IllegalArgumentException("Unsupported streamable type: ${streamable.type}")
+		}
+		val directUrl = streamable.extras["directUrl"] ?: streamable.extras["source"]
+			?: throw IllegalStateException("Missing direct stream URL")
+		val quality = streamable.extras["quality"]?.toIntOrNull() ?: streamable.quality
+		val title = streamable.title ?: if (quality > 0) "${quality}kbps" else "Stream"
+		val httpSource = Http(
+			request = directUrl.toGetRequest(),
+			type = SourceType.Progressive,
+			quality = quality,
+			title = title
+		)
+		return Streamable.Media.Server(listOf(httpSource), false)
+	}
+
+	override suspend fun loadFeed(track: Track): Feed<Shelf> {
+		val sourceUrl = track.extras["url"] ?: return emptyList<Shelf>().toFeed()
+		val details = try {
+			songCache[sourceUrl] ?: fetchSongDetails(sourceUrl)
+		} catch (_: Exception) {
+			return emptyList<Shelf>().toFeed()
+		}
+		if (details.relatedTracks.isEmpty()) return emptyList<Shelf>().toFeed()
+		val shelf = Shelf.Lists.Tracks(
+			id = "groove_related_tracks",
+			title = "Related Songs",
+			list = details.relatedTracks
+		)
+		return listOf(shelf).toFeed()
+	}
+
+	override suspend fun loadFeed(album: Album): Feed<Shelf>? = null
+
+	private suspend fun loadCategorySection(config: CategoryConfig, shelves: MutableList<Shelf>) {
+		val now = System.currentTimeMillis()
+		val freshCache = categoryCache[config.url]?.takeIf { now - it.timestamp <= CATEGORY_CACHE_TTL_MS }
+		if (freshCache != null) {
+			addCategoryAlbumShelf(config, freshCache.categoryName, freshCache.albums, shelves)
+			return
+		}
+
+		val staleCache = categoryCache[config.url]
+
+		runCatching { queries.categoryFeed(config.url) }
+			.onSuccess { response ->
+				val categoryName = response.category?.takeIf { it.isNotBlank() }
+					?: response.title?.takeIf { it.isNotBlank() }
+					?: config.fallbackName
+				val albums = response.albums.mapNotNull {
+					converter.toCategoryAlbum(it, response.timestamp, categoryName)
+				}
+				if (albums.isNotEmpty()) {
+					val fetchedAt = System.currentTimeMillis()
+					val entry = CategoryCacheEntry(
+						timestamp = fetchedAt,
+						categoryName = categoryName,
+						albums = albums
+					)
+					categoryCache[config.url] = entry
+					addCategoryAlbumShelf(config, categoryName, albums, shelves)
+				} else if (staleCache != null) {
+					addCategoryAlbumShelf(config, staleCache.categoryName, staleCache.albums, shelves)
+				}
+			}
+			.onFailure { error ->
+				if (error is CancellationException) throw error
+				if (staleCache != null) {
+					println("WARN: Falling back to cached ${config.fallbackName} feed: ${error.message}")
+					addCategoryAlbumShelf(config, staleCache.categoryName, staleCache.albums, shelves)
+				} else {
+					println("WARN: Failed to load ${config.fallbackName} feed: ${error.message}")
+				}
+			}
+	}
+
+	private fun addCategoryAlbumShelf(
+		config: CategoryConfig,
+		categoryName: String,
+		albums: List<Album>,
+		shelves: MutableList<Shelf>
+	) {
+		albums.takeIf { it.isNotEmpty() }?.let { list ->
+			shelves.add(
+				Shelf.Lists.Items(
+					id = config.albumShelfId,
+					title = "$categoryName Albums",
+					list = list
+				)
+			)
+		}
+	}
+
+	private suspend fun fetchSongDetails(url: String): GrooveSongDetailsResult {
+		return songCache[url] ?: run {
+			val response = retryWithDelay(SONG_DETAILS_RETRY_COUNT, SONG_DETAILS_RETRY_DELAY_MS) {
+				queries.songDetails(url)
+			}
+			val result = converter.toSongDetails(response)
+			songCache[url] = result
+			result
+		}
+	}
+
+	private suspend fun fetchAlbumTracksPage(startUrl: String): GrooveAlbumPageResult? {
+		var currentUrl: String? = startUrl
+		val visited = mutableSetOf<String>()
+		var lastResult: GrooveAlbumPageResult? = null
+		repeat(ALBUM_PAGE_MAX_HOPS) {
+			val url = currentUrl?.takeIf { it.isNotBlank() } ?: return lastResult
+			if (!visited.add(url)) return lastResult
+			val page = runCatching { queries.albumPage(url) }
+				.onFailure { error ->
+					if (error is CancellationException) throw error
+				}
+				.getOrElse { return lastResult }
+				.let { converter.toAlbumPage(it) }
+			lastResult = page
+			if (page.tracks.isNotEmpty()) return page
+				currentUrl = page.nextPageUrl?.takeIf { it.isNotBlank() }
+		}
+		return lastResult
+	}
+
+	private suspend fun <T> retryWithDelay(
+		attempts: Int,
+		delayMillis: Long,
+		block: suspend () -> T
+	): T {
+		var lastError: Throwable? = null
+		repeat(attempts.coerceAtLeast(1)) { attemptIndex ->
+			try {
+				return block()
+			} catch (error: Throwable) {
+				if (error is CancellationException) throw error
+				lastError = error
+				if (attemptIndex < attempts - 1) {
+					delay(delayMillis)
+				}
+			}
+		}
+		throw lastError ?: IllegalStateException("retryWithDelay failed without error")
+	}
+
+	companion object {
+		private const val CATEGORY_LOAD_DELAY_MS = 250L
+		private const val ALBUM_PAGE_MAX_HOPS = 5
+		private const val SONG_DETAILS_RETRY_COUNT = 2
+		private const val SONG_DETAILS_RETRY_DELAY_MS = 300L
+		private const val CATEGORY_CACHE_TTL_MS = 60_000L
+	}
 }
+
